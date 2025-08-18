@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Finance App</title>
+    <style>
+      body { margin:0; font-family: ui-sans-serif, system-ui; background:#f6f7f9; }
+      #err { white-space: pre-wrap; color:#b91c1c; padding:16px; margin:16px; background:#fff; border:1px solid #eee; border-radius:12px; display:none; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <pre id="err"></pre>
+    <script>
+      const show = (t)=>{ const e=document.getElementById('err'); e.style.display='block'; e.textContent=t }
+      window.addEventListener('error', e => {
+        show('JS Error: ' + (e.error?.message || e.message) + '\n' + (e.error?.stack || ''))
+      })
+      window.addEventListener('unhandledrejection', e => {
+        const r = e.reason
+        show('Promise Rejection: ' + (r?.message || String(r)) + '\n' + (r?.stack || ''))
+      })
+    </script>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
