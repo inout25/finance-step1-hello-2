@@ -1,503 +1,677 @@
-// src/App.jsx
 import { useEffect, useMemo, useState } from "react";
-import { supabase } from "./supabaseClient";
+import { createClient } from "@supabase/supabase-js";
 
-// ---------- helpers ----------
-const fmtKWD = (n, show = true) =>
-  `${Number(n || 0).toLocaleString(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}${show ? " KD" : ""}`;
 
-const monthNames = [
-  "January","February","March","April","May","June",
-  "July","August","September","October","November","December"
-];
+/**
+ * Assumes you already have env vars in Vite:
+ *  VITE_SUPABASE_URL
+ *  VITE_SUPABASE_ANON_KEY
+ */
+const supabase = createClient(
+  import.meta.env.VITE_SUPABASE_URL,
+  import.meta.env.VITE_SUPABASE_ANON_KEY
+);
 
-function rangeForMonthYear(monthIdx, year) {
-  const start = new Date(Date.UTC(year, monthIdx, 1, 0, 0, 0));
-  const end = new Date(Date.UTC(year, monthIdx + 1, 1, 0, 0, 0));
+const currency = (n, showKwd) =>
+  `${showKwd ? "KWD " : ""}${Number(n || 0).toLocaleString(undefined, {
+    minimumFractionDigits: 3,
+    maximumFractionDigits: 3,
+  })}`;
+
+function useSession() {
+  const [session, setSession] = useState(null);
+
+  useEffect(() => {
+    let mounted = true;
+    supabase.auth.getSession().then(({ data }) => {
+      if (mounted) setSession(data?.session ?? null);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
+      setSession(s);
+    });
+    return () => {
+      mounted = false;
+      sub?.subscription?.unsubscribe?.();
+    };
+  }, []);
+
+  return session;
+}
+
+async function fetchProfile() {
+  const { data, error } = await supabase
+    .from("profile")
+    .select("id, role, display_name")
+    .eq("id", (await supabase.auth.getUser()).data.user.id)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function upsertDisplayName(display_name) {
+  const { data: { user } } = await supabase.auth.getUser();
+  const { error } = await supabase
+    .from("profile")
+    .upsert({ id: user.id, display_name }, { onConflict: "id" });
+  if (error) throw error;
+}
+
+async function setRole(role) {
+  const { data: { user } } = await supabase.auth.getUser();
+  const { error } = await supabase.from("profile").update({ role }).eq("id", user.id);
+  if (error) throw error;
+}
+
+function useMonthYear() {
+  const now = new Date();
+  const [month, setMonth] = useState(now.getMonth());
+  const [year, setYear] = useState(now.getFullYear());
+  return { month, setMonth, year, setYear };
+}
+
+function monthStartEnd(month, year) {
+  const start = new Date(year, month, 1);
+  const end = new Date(year, month + 1, 1); // exclusive
   return { start: start.toISOString(), end: end.toISOString() };
 }
 
-function EditInline({ initial, onCancel, onSave, saving }) {
-  const [form, setForm] = useState({ ...initial });
+async function fetchIN({ startISO, endISO, userIdFilter }) {
+  let q = supabase
+    .from("transactions")
+    .select("id, created_at, amount, client_account, client_name, period, note, user_id")
+    .gte("created_at", startISO)
+    .lt("created_at", endISO)
+    .order("created_at", { ascending: false });
+
+  if (userIdFilter) q = q.eq("user_id", userIdFilter);
+  const { data, error } = await q;
+  if (error) throw error;
+  return data || [];
+}
+
+async function fetchOUT({ startISO, endISO, userIdFilter, includePendingInTotals }) {
+  let q = supabase
+    .from("withdrawals")
+    .select("id, created_at, amount, client_account, client_name, note, status, user_id")
+    .gte("created_at", startISO)
+    .lt("created_at", endISO)
+    .order("created_at", { ascending: false });
+
+  if (userIdFilter) q = q.eq("user_id", userIdFilter);
+  const { data, error } = await q;
+  if (error) throw error;
+  // Totals will optionally include pending; listing still shows all.
+  const list = data || [];
+  const totalApproved = list
+    .filter(r => includePendingInTotals ? true : r.status === "approved")
+    .reduce((s, r) => s + Number(r.amount || 0), 0);
+
+  return { list, totalApproved };
+}
+
+function useMonthData({ month, year, forUserId, includePendingOutInTotals }) {
+  const [loading, setLoading] = useState(true);
+  const [inRows, setInRows] = useState([]);
+  const [outRows, setOutRows] = useState([]);
+  const [outTotalApproved, setOutTotalApproved] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    const { start, end } = monthStartEnd(month, year);
+    setLoading(true);
+    Promise.all([
+      fetchIN({ startISO: start, endISO: end, userIdFilter: forUserId }),
+      fetchOUT({
+        startISO: start,
+        endISO: end,
+        userIdFilter: forUserId,
+        includePendingInTotals: includePendingOutInTotals,
+      }),
+    ])
+      .then(([ins, outs]) => {
+        if (cancelled) return;
+        setInRows(ins);
+        setOutRows(outs.list);
+        setOutTotalApproved(outs.totalApproved);
+      })
+      .finally(() => !cancelled && setLoading(false));
+    return () => {
+      cancelled = true;
+    };
+  }, [month, year, forUserId, includePendingOutInTotals]);
+
+  const inTotal = useMemo(
+    () => inRows.reduce((s, r) => s + Number(r.amount || 0), 0),
+    [inRows]
+  );
+
+  return { loading, inRows, outRows, inTotal, outTotalApproved };
+}
+
+function InlineNumber({ value, onChange }) {
   return (
-    <tr>
-      <td colSpan={8} style={{ background: "#fafafa" }}>
-        <div style={{ display: "grid", gap: 8, gridTemplateColumns: "repeat(6, 1fr) auto auto" }}>
-          <input
-            placeholder="Amount"
-            type="number"
-            value={form.amount ?? ""}
-            onChange={(e) => setForm((f) => ({ ...f, amount: e.target.value }))}
-          />
-          <input
-            placeholder="Client name"
-            value={form.client_name ?? ""}
-            onChange={(e) => setForm((f) => ({ ...f, client_name: e.target.value }))}
-          />
-          <input
-            placeholder="Client account"
-            value={form.client_account ?? ""}
-            onChange={(e) => setForm((f) => ({ ...f, client_account: e.target.value }))}
-          />
-          <select
-            value={form.pref ?? "monthly"}
-            onChange={(e) => setForm((f) => ({ ...f, pref: e.target.value }))}
-          >
-            <option value="monthly">Monthly</option>
-            <option value="yearly">Yearly</option>
-          </select>
-          <input
-            placeholder="Note"
-            value={form.note ?? ""}
-            onChange={(e) => setForm((f) => ({ ...f, note: e.target.value }))}
-          />
-          <button disabled={saving} onClick={() => onSave(form)}>{saving ? "Saving…" : "Save"}</button>
-          <button onClick={onCancel}>Cancel</button>
-        </div>
-      </td>
-    </tr>
+    <input
+      type="number"
+      step="0.001"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      className="input"
+    />
   );
 }
 
-// ---------- main ----------
+function InlineText({ value, onChange, placeholder }) {
+  return (
+    <input
+      type="text"
+      value={value ?? ""}
+      placeholder={placeholder}
+      onChange={(e) => onChange(e.target.value)}
+      className="input"
+    />
+  );
+}
+
+function RowActions({ saving, onSave, onCancel }) {
+  return (
+    <div className="row-actions">
+      <button disabled={saving} onClick={onSave} className="btn-primary">
+        {saving ? "Saving..." : "Save"}
+      </button>
+      <button disabled={saving} onClick={onCancel} className="btn">
+        Cancel
+      </button>
+    </div>
+  );
+}
+
 export default function App() {
-  const [session, setSession] = useState(null);
-  const [profile, setProfile] = useState(null); // { id, email, name, role }
-  const isManager = profile?.role === "manager";
-
-  // filters
-  const now = new Date();
-  const [monthIdx, setMonthIdx] = useState(now.getUTCMonth());
-  const [year, setYear] = useState(now.getUTCFullYear());
+  const session = useSession();
+  const { month, setMonth, year, setYear } = useMonthYear();
   const [showKwd, setShowKwd] = useState(true);
+  const [includePending, setIncludePending] = useState(false);
 
-  const { start, end } = useMemo(() => rangeForMonthYear(monthIdx, year), [monthIdx, year]);
+  // profile
+  const [profile, setProfile] = useState(null);
+  const role = profile?.role ?? "employee";
 
-  // data
-  const [inRows, setInRows] = useState([]);
-  const [outRows, setOutRows] = useState([]);
-  const [reqRows, setReqRows] = useState([]); // withdrawals (all) for manager view
+  // form state
+  const [inAmt, setInAmt] = useState("");
+  const [inClientName, setInClientName] = useState("");
+  const [inClientAcc, setInClientAcc] = useState("");
+  const [inPeriod, setInPeriod] = useState("monthly");
+  const [inNote, setInNote] = useState("");
 
-  // forms
-  const [inForm, setInForm] = useState({ amount: "", client_name: "", client_account: "", pref: "monthly", note: "" });
-  const [outForm, setOutForm] = useState({ amount: "", client_name: "", client_account: "", pref: "monthly", note: "" });
+  const [outAmt, setOutAmt] = useState("");
+  const [outClientName, setOutClientName] = useState("");
+  const [outClientAcc, setOutClientAcc] = useState("");
+  const [outNote, setOutNote] = useState("");
 
-  // editing
-  const [editKey, setEditKey] = useState(null); // {type:'in'|'out', id}
-  const [savingEdit, setSavingEdit] = useState(false);
+  // editing state
+  const [editIN, setEditIN] = useState(null);   // { id, amount, client_name, client_account, note }
+  const [editOUT, setEditOUT] = useState(null); // { id, amount, client_name, client_account, note }
 
-  // totals
-  const totals = useMemo(() => {
-    const tIn = inRows.reduce((s, r) => s + Number(r.amount || 0), 0);
-    // OUT totals count only approved withdrawals
-    const tOut = outRows.filter(r => r.status === "approved").reduce((s, r) => s + Number(r.amount || 0), 0);
-    return { in: tIn, out: tOut, net: tIn - tOut };
-  }, [inRows, outRows]);
+  const forUserId = role === "manager" ? null : session?.user?.id ?? null;
 
-  // ---- session + profile ----
+  const { loading, inRows, outRows, inTotal, outTotalApproved } = useMonthData({
+    month,
+    year,
+    forUserId,
+    includePendingOutInTotals: includePending,
+  });
+
+  const net = inTotal - outTotalApproved;
+
+  // load profile on session change
   useEffect(() => {
-    const init = async () => {
-      const { data: { session } } = await supabase.auth.getSession();
-      setSession(session);
-      if (session?.user) {
-        await loadProfile(session.user.id);
-      }
-    };
-    init();
+    if (!session) { setProfile(null); return; }
+    fetchProfile().then(setProfile).catch(() => setProfile(null));
+  }, [session]);
 
-    const { data: listener } = supabase.auth.onAuthStateChange((_e, s) => {
-      setSession(s);
-      if (s?.user) loadProfile(s.user.id);
-      else setProfile(null);
-    });
-    return () => listener.subscription.unsubscribe();
-  }, []);
-
-  async function loadProfile(uid) {
-    // profile table (not "profiles")
-    const { data, error } = await supabase
-      .from("profile")
-      .select("id, email, name, role")
-      .eq("id", uid)
-      .maybeSingle();
-    if (!error && data) setProfile(data);
+  async function handleSignOut() {
+    await supabase.auth.signOut();
   }
 
-  // ---- load data for selected month ----
-  useEffect(() => {
-    if (!session?.user) return;
-    const load = async () => {
-      // IN rows: the employee sees own; manager sees all (but we’ll still show own list below)
-      const inQ = supabase
-        .from("transactions")
-        .select("id, created_at, amount, client_name, client_account, pref, note, user_id")
-        .gte("created_at", start).lt("created_at", end)
-        .order("created_at", { ascending: false });
+  async function saveDisplayName() {
+    const newName = window.prompt("Enter display name", profile?.display_name ?? "");
+    if (newName == null) return;
+    await upsertDisplayName(newName.trim());
+    const p = await fetchProfile();
+    setProfile(p);
+  }
 
-      const outQ = supabase
-        .from("withdrawals")
-        .select("id, created_at, amount, client_name, client_account, pref, note, status, user_id")
-        .gte("created_at", start).lt("created_at", end)
-        .order("created_at", { ascending: false });
+  async function promoteToManager() {
+    await setRole("manager");
+    const p = await fetchProfile();
+    setProfile(p);
+  }
 
-      const [inRes, outRes] = await Promise.all([inQ, outQ]);
-      if (!inRes.error) setInRows(isManager ? inRes.data : inRes.data.filter(r => r.user_id === session.user.id));
-      if (!outRes.error) setOutRows(isManager ? outRes.data : outRes.data.filter(r => r.user_id === session.user.id));
+  async function demoteToEmployee() {
+    await setRole("employee");
+    const p = await fetchProfile();
+    setProfile(p);
+  }
 
-      if (isManager) {
-        // show pending list (requests center)
-        const reqRes = await supabase
-          .from("withdrawals")
-          .select("id, created_at, amount, client_name, client_account, note, status, user_id")
-          .gte("created_at", start).lt("created_at", end)
-          .order("created_at", { ascending: false });
-        if (!reqRes.error) setReqRows(reqRes.data);
-      } else {
-        setReqRows([]);
-      }
-    };
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session?.user?.id, isManager, start, end]);
-
-  // ---- actions ----
   async function addIN() {
-    if (!session?.user) return;
-    const payload = {
-      amount: Number(inForm.amount || 0),
-      client_name: (inForm.client_name || "").trim(),
-      client_account: (inForm.client_account || "").trim(),
-      note: (inForm.note || "").trim(),
-      pref: inForm.pref || "monthly",
-      user_id: session.user.id
-    };
-    const { error } = await supabase.from("transactions").insert(payload);
-    if (error) return alert(error.message);
-    setInForm({ amount: "", client_name: "", client_account: "", pref: inForm.pref, note: "" });
-    // reload
-    const { data } = await supabase
-      .from("transactions")
-      .select("id, created_at, amount, client_name, client_account, pref, note, user_id")
-      .gte("created_at", start).lt("created_at", end)
-      .order("created_at", { ascending: false });
-    setInRows(isManager ? data : data.filter(r => r.user_id === session.user.id));
+    if (!inAmt || !inClientAcc) {
+      alert("Amount and Client Account are required.");
+      return;
+    }
+    const { data: { user } } = await supabase.auth.getUser();
+    const { error } = await supabase.from("transactions").insert({
+      user_id: user.id,
+      amount: Number(inAmt),
+      client_account: inClientAcc.trim(),
+      client_name: inClientName.trim() || null,
+      period: inPeriod,
+      note: inNote.trim() || null,
+    });
+    if (error) { alert(error.message); return; }
+    // reset and reload
+    setInAmt(""); setInClientAcc(""); setInClientName(""); setInNote("");
+    const p = monthStartEnd(month, year);
+    const ins = await fetchIN({ startISO: p.start, endISO: p.end, userIdFilter: forUserId });
+    setEditIN(null);
+    // quick replace list without refetching OUT
+    setTimeout(() => window.location.reload(), 50);
   }
 
   async function addOUT() {
-    if (!session?.user) return;
-    const payload = {
-      amount: Number(outForm.amount || 0),
-      client_name: (outForm.client_name || "").trim(),
-      client_account: (outForm.client_account || "").trim(),
-      note: (outForm.note || "").trim(),
-      pref: outForm.pref || "monthly",
+    if (!outAmt || !outClientAcc) {
+      alert("Amount and Client Account are required.");
+      return;
+    }
+    const { data: { user } } = await supabase.auth.getUser();
+    const { error } = await supabase.from("withdrawals").insert({
+      user_id: user.id,
+      amount: Number(outAmt),
+      client_account: outClientAcc.trim(),
+      client_name: outClientName.trim() || null,
+      note: outNote.trim() || null,
       status: "pending",
-      user_id: session.user.id
-    };
-    const { error } = await supabase.from("withdrawals").insert(payload);
-    if (error) return alert(error.message);
-    setOutForm({ amount: "", client_name: "", client_account: "", pref: outForm.pref, note: "" });
-    const { data } = await supabase
-      .from("withdrawals")
-      .select("id, created_at, amount, client_name, client_account, pref, note, status, user_id")
-      .gte("created_at", start).lt("created_at", end)
-      .order("created_at", { ascending: false });
-    setOutRows(isManager ? data : data.filter(r => r.user_id === session.user.id));
-    if (isManager) setReqRows(data);
+    });
+    if (error) { alert(error.message); return; }
+    setOutAmt(""); setOutClientAcc(""); setOutClientName(""); setOutNote("");
+    setTimeout(() => window.location.reload(), 50);
   }
 
-  async function updateRow(kind, id, patch) {
-    setSavingEdit(true);
-    const table = kind === "in" ? "transactions" : "withdrawals";
-    const { error } = await supabase.from(table).update({
-      amount: Number(patch.amount || 0),
-      client_name: patch.client_name ?? null,
-      client_account: patch.client_account ?? null,
-      note: patch.note ?? null,
-      pref: patch.pref ?? "monthly"
-    }).eq("id", id);
-    setSavingEdit(false);
-    if (error) return alert(error.message);
-    setEditKey(null);
-    // refresh both sets
-    const [inRes, outRes] = await Promise.all([
-      supabase.from("transactions").select("*").gte("created_at", start).lt("created_at", end).order("created_at", { ascending: false }),
-      supabase.from("withdrawals").select("*").gte("created_at", start).lt("created_at", end).order("created_at", { ascending: false }),
-    ]);
-    if (!inRes.error) setInRows(isManager ? inRes.data : inRes.data.filter(r => r.user_id === session?.user?.id));
-    if (!outRes.error) {
-      setOutRows(isManager ? outRes.data : outRes.data.filter(r => r.user_id === session?.user?.id));
-      if (isManager) setReqRows(outRes.data);
-    }
+  async function saveINEdit() {
+    if (!editIN) return;
+    const { id, amount, client_account, client_name, note } = editIN;
+    const { error } = await supabase
+      .from("transactions")
+      .update({
+        amount: Number(amount),
+        client_account: client_account?.trim(),
+        client_name: (client_name ?? "").trim() || null,
+        note: (note ?? "").trim() || null,
+      })
+      .eq("id", id);
+    if (error) { alert(error.message); return; }
+    setEditIN(null);
+    setTimeout(() => window.location.reload(), 50);
+  }
+
+  async function saveOUTEdit() {
+    if (!editOUT) return;
+    const { id, amount, client_account, client_name, note } = editOUT;
+    const { error } = await supabase
+      .from("withdrawals")
+      .update({
+        amount: Number(amount),
+        client_account: client_account?.trim(),
+        client_name: (client_name ?? "").trim() || null,
+        note: (note ?? "").trim() || null,
+      })
+      .eq("id", id);
+    if (error) { alert(error.message); return; }
+    setEditOUT(null);
+    setTimeout(() => window.location.reload(), 50);
   }
 
   async function setWithdrawStatus(id, status) {
     const { error } = await supabase.from("withdrawals").update({ status }).eq("id", id);
-    if (error) return alert(error.message);
-    // refresh
-    const { data } = await supabase
-      .from("withdrawals")
-      .select("*")
-      .gte("created_at", start).lt("created_at", end)
-      .order("created_at", { ascending: false });
-    setOutRows(isManager ? data : data.filter(r => r.user_id === session?.user?.id));
-    if (isManager) setReqRows(data);
+    if (error) { alert(error.message); return; }
+    setTimeout(() => window.location.reload(), 50);
   }
 
-  // profile updates
-  async function saveDisplayName(name) {
-    if (!session?.user) return;
-    const { error } = await supabase.from("profile").update({ name }).eq("id", session.user.id);
-    if (error) alert(error.message);
-    else setProfile((p) => ({ ...p, name }));
-  }
-
-  // ---- UI ----
   if (!session) {
-    // keep it dead simple: show only a sign-in link via Supabase OTP
     return (
-      <div style={{ maxWidth: 1100, margin: "30px auto", padding: 12 }}>
-        <h1>INOUT</h1>
-        <p>Sign in to continue.</p>
-        <button
-          onClick={async () => {
-            const email = prompt("Enter your email to sign in");
-            if (!email) return;
-            const { error } = await supabase.auth.signInWithOtp({ email });
-            if (error) alert(error.message);
-            else alert("Magic link sent. Check your email.");
-          }}
-        >
-          Sign in with Email
-        </button>
+      <div className="page">
+        <div className="card">
+          <h1>INOUT</h1>
+          <p>Please sign in to continue.</p>
+          <AuthButtons />
+        </div>
       </div>
     );
   }
 
   return (
-    <div style={{ maxWidth: 1100, margin: "30px auto", padding: 12 }}>
-      {/* header / profile */}
-      <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-        <h1 style={{ marginRight: "auto" }}>INOUT</h1>
-        <div>Role: <strong>{isManager ? "manager" : "employee"}</strong></div>
-        <button onClick={() => supabase.auth.signOut()}>Sign out</button>
-      </div>
-
-      <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8 }}>
-        <input
-          placeholder="Display name"
-          defaultValue={profile?.name ?? ""}
-          onBlur={(e) => saveDisplayName(e.target.value)}
-          style={{ width: 220 }}
-        />
-        <button onClick={() => {
-          const input = document.querySelector('input[placeholder="Display name"]');
-          if (input) saveDisplayName(input.value);
-        }}>Save</button>
-
-        <select value={monthIdx} onChange={(e) => setMonthIdx(Number(e.target.value))}>
-          {monthNames.map((m, i) => <option key={i} value={i}>{m}</option>)}
-        </select>
-        <select value={year} onChange={(e) => setYear(Number(e.target.value))}>
-          {Array.from({ length: 6 }).map((_, i) => {
-            const y = now.getUTCFullYear() - 3 + i;
-            return <option key={y} value={y}>{y}</option>;
-          })}
-        </select>
-        <label style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
-          <input type="checkbox" checked={showKwd} onChange={() => setShowKwd(s => !s)} /> Show KWD
-        </label>
-      </div>
-
-      {/* totals */}
-      <section style={{ marginTop: 16, border: "1px solid #e5e7eb", borderRadius: 10, padding: 14 }}>
-        <h2 style={{ marginTop: 0 }}>Totals — {monthNames[monthIdx]} {year}</h2>
-        <div style={{ display: "flex", gap: 14 }}>
-          <div><strong>Total IN:</strong> {fmtKWD(totals.in, showKwd)}</div>
-          <div><strong>Total OUT:</strong> {fmtKWD(totals.out, showKwd)}</div>
-          <div><strong>Net:</strong> {fmtKWD(totals.net, showKwd)}</div>
+    <div className="page">
+      <div className="card header">
+        <div className="row wrap">
+          <h1>INOUT</h1>
+          <div className="spacer" />
+          <button className="btn" onClick={() => setShowKwd(v => !v)}>
+            {showKwd ? "Hide KWD" : "Show KWD"}
+          </button>
+          <button className="btn" onClick={() => setIncludePending(v => !v)}>
+            {includePending ? "Exclude pending OUT" : "Count pending OUT"}
+          </button>
+          <button className="btn" onClick={handleSignOut}>Sign out</button>
         </div>
-      </section>
 
-      {/* Add IN */}
-      <section style={{ marginTop: 16, border: "1px solid #e5e7eb", borderRadius: 10, padding: 14 }}>
-        <h3>Add IN</h3>
-        <div style={{ display: "grid", gap: 8, gridTemplateColumns: "repeat(5, 1fr) auto" }}>
-          <input placeholder="Amount" type="number" value={inForm.amount} onChange={(e) => setInForm(f => ({ ...f, amount: e.target.value }))} />
-          <input placeholder="Client name" value={inForm.client_name} onChange={(e) => setInForm(f => ({ ...f, client_name: e.target.value }))} />
-          <input placeholder="Client account" value={inForm.client_account} onChange={(e) => setInForm(f => ({ ...f, client_account: e.target.value }))} />
-          <select value={inForm.pref} onChange={(e) => setInForm(f => ({ ...f, pref: e.target.value }))}>
+        <div className="row wrap mt8">
+          <label className="inline">
+            Month&nbsp;
+            <select value={month} onChange={(e) => setMonth(Number(e.target.value))}>
+              {Array.from({ length: 12 }).map((_, i) => (
+                <option key={i} value={i}>
+                  {new Date(2000, i, 1).toLocaleString(undefined, { month: "long" })}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="inline">
+            Year&nbsp;
+            <select value={year} onChange={(e) => setYear(Number(e.target.value))}>
+              {Array.from({ length: 6 }).map((_, i) => {
+                const y = new Date().getFullYear() - 2 + i;
+                return (
+                  <option key={y} value={y}>{y}</option>
+                );
+              })}
+            </select>
+          </label>
+
+          <div className="spacer" />
+
+          {profile && (
+            <div className="row gap8">
+              <span>Logged in as <b>{profile.display_name || session.user.email}</b> — <em>{role}</em></span>
+              <button className="btn" onClick={saveDisplayName}>Edit name</button>
+              {role === "employee" ? (
+                <button className="btn" onClick={promoteToManager}>Switch to manager</button>
+              ) : (
+                <button className="btn" onClick={demoteToEmployee}>Switch to employee</button>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="metrics row wrap">
+        <Metric title="Total IN" value={currency(inTotal, showKwd)} tone="green" />
+        <Metric title={`Total OUT ${includePending ? "(approved+pending)" : "(approved)"}`} value={currency(outTotalApproved, showKwd)} tone="red" />
+        <Metric title="Net Profit" value={currency(net, showKwd)} tone={net >= 0 ? "green" : "red"} />
+      </div>
+
+      <div className="card">
+        <h2>Add Money IN (Deposit)</h2>
+        <div className="row wrap gap8">
+          <InlineNumber value={inAmt} onChange={setInAmt} />
+          <InlineText value={inClientName} onChange={setInClientName} placeholder="Client name" />
+          <InlineText value={inClientAcc} onChange={setInClientAcc} placeholder="Client account #" />
+          <select className="input" value={inPeriod} onChange={(e) => setInPeriod(e.target.value)}>
             <option value="monthly">Monthly</option>
             <option value="yearly">Yearly</option>
           </select>
-          <input placeholder="Note (optional)" value={inForm.note} onChange={(e) => setInForm(f => ({ ...f, note: e.target.value }))} />
-          <button onClick={addIN}>Add</button>
+          <InlineText value={inNote} onChange={setInNote} placeholder="Note (optional)" />
+          <button className="btn-primary" onClick={addIN}>Add IN</button>
         </div>
-      </section>
+      </div>
 
-      {/* Add OUT */}
-      <section style={{ marginTop: 16, border: "1px solid #e5e7eb", borderRadius: 10, padding: 14 }}>
-        <h3>Add OUT</h3>
-        <div style={{ display: "grid", gap: 8, gridTemplateColumns: "repeat(5, 1fr) auto" }}>
-          <input placeholder="Amount" type="number" value={outForm.amount} onChange={(e) => setOutForm(f => ({ ...f, amount: e.target.value }))} />
-          <input placeholder="Client name" value={outForm.client_name} onChange={(e) => setOutForm(f => ({ ...f, client_name: e.target.value }))} />
-          <input placeholder="Client account" value={outForm.client_account} onChange={(e) => setOutForm(f => ({ ...f, client_account: e.target.value }))} />
-          <select value={outForm.pref} onChange={(e) => setOutForm(f => ({ ...f, pref: e.target.value }))}>
-            <option value="monthly">Monthly</option>
-            <option value="yearly">Yearly</option>
-          </select>
-          <input placeholder="Note (optional)" value={outForm.note} onChange={(e) => setOutForm(f => ({ ...f, note: e.target.value }))} />
-          <button onClick={addOUT}>Submit</button>
+      <div className="card">
+        <h2>Withdrawal Request (OUT)</h2>
+        <div className="row wrap gap8">
+          <InlineNumber value={outAmt} onChange={setOutAmt} />
+          <InlineText value={outClientName} onChange={setOutClientName} placeholder="Client name" />
+          <InlineText value={outClientAcc} onChange={setOutClientAcc} placeholder="Client account #" />
+          <InlineText value={outNote} onChange={setOutNote} placeholder="Note (optional)" />
+          <button className="btn-primary" onClick={addOUT}>Submit</button>
         </div>
-      </section>
+      </div>
 
-      {/* Your IN rows */}
-      <section style={{ marginTop: 16, border: "1px solid #e5e7eb", borderRadius: 10, padding: 14 }}>
-        <h3>Your IN ({monthNames[monthIdx]} {year})</h3>
-        <table width="100%">
+      {role === "manager" && (
+        <div className="card">
+          <h2>Withdrawal Requests Center — {new Date(year, month, 1).toLocaleString(undefined, { month: "short", day: "2-digit" })}</h2>
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Date</th><th>Employee</th><th>Amount</th><th>Client</th><th>Status</th><th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {outRows.length === 0 && (
+                <tr><td colSpan="6" className="muted">No requests.</td></tr>
+              )}
+              {outRows.map((r) => {
+                const editing = editOUT?.id === r.id;
+                return (
+                  <tr key={r.id}>
+                    <td>{new Date(r.created_at).toLocaleString()}</td>
+                    <td>{r.user_id?.slice(0, 6)}…</td>
+                    <td>
+                      {editing ? (
+                        <InlineNumber
+                          value={editOUT.amount}
+                          onChange={(v) => setEditOUT((e) => ({ ...e, amount: v }))}
+                        />
+                      ) : currency(r.amount, showKwd)}
+                    </td>
+                    <td>
+                      {editing ? (
+                        <div className="col">
+                          <InlineText
+                            value={editOUT.client_name}
+                            onChange={(v) => setEditOUT((e) => ({ ...e, client_name: v }))}
+                            placeholder="Client name"
+                          />
+                          <InlineText
+                            value={editOUT.client_account}
+                            onChange={(v) => setEditOUT((e) => ({ ...e, client_account: v }))}
+                            placeholder="Client account #"
+                          />
+                          <InlineText
+                            value={editOUT.note}
+                            onChange={(v) => setEditOUT((e) => ({ ...e, note: v }))}
+                            placeholder="Note"
+                          />
+                        </div>
+                      ) : (
+                        <div className="col">
+                          <div>{r.client_name || "-"}</div>
+                          <div className="muted">{r.client_account || "-"}</div>
+                          {r.note && <div className="muted">{r.note}</div>}
+                        </div>
+                      )}
+                    </td>
+                    <td>
+                      <span className={`pill ${r.status}`}>{r.status}</span>
+                    </td>
+                    <td>
+                      {editing ? (
+                        <RowActions
+                          saving={false}
+                          onSave={saveOUTEdit}
+                          onCancel={() => setEditOUT(null)}
+                        />
+                      ) : (
+                        <div className="row gap8">
+                          <button className="btn" onClick={() => setEditOUT({
+                            id: r.id,
+                            amount: r.amount,
+                            client_account: r.client_account,
+                            client_name: r.client_name,
+                            note: r.note,
+                          })}>Edit</button>
+                          <button className="btn" onClick={() => setWithdrawStatus(r.id, "approved")}>Approve</button>
+                          <button className="btn" onClick={() => setWithdrawStatus(r.id, "rejected")}>Reject</button>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="card">
+        <h2>Your IN (This Month)</h2>
+        <table className="table">
           <thead>
             <tr>
-              <th align="left">Date</th>
-              <th align="right">Amount</th>
-              <th align="left">Client</th>
-              <th align="left">Account</th>
-              <th align="left">Pref</th>
-              <th align="left">Note</th>
-              <th></th>
+              <th>Date</th><th>Amount</th><th>Client</th><th>Period</th><th>Note</th><th></th>
             </tr>
           </thead>
           <tbody>
             {inRows.length === 0 && (
-              <tr><td colSpan={7} style={{ color: "#777" }}>No entries.</td></tr>
+              <tr><td colSpan="6" className="muted">No entries.</td></tr>
             )}
-            {inRows.map(row => {
-              const isEditing = editKey?.type === "in" && editKey?.id === row.id;
-              const canEdit = isManager || row.user_id === session.user.id;
-              if (isEditing) {
-                return (
-                  <EditInline
-                    key={row.id}
-                    initial={row}
-                    saving={savingEdit}
-                    onCancel={() => setEditKey(null)}
-                    onSave={(patch) => updateRow("in", row.id, patch)}
-                  />
-                );
-              }
+            {inRows.map((r) => {
+              const editing = editIN?.id === r.id;
+              const isMine = r.user_id === session.user.id;
               return (
-                <tr key={row.id}>
-                  <td>{new Date(row.created_at).toLocaleString()}</td>
-                  <td align="right">{fmtKWD(row.amount, showKwd)}</td>
-                  <td>{row.client_name}</td>
-                  <td>{row.client_account}</td>
-                  <td>{row.pref}</td>
-                  <td>{row.note}</td>
-                  <td align="right">
-                    {canEdit && <button onClick={() => setEditKey({ type: "in", id: row.id })}>Edit</button>}
+                <tr key={r.id}>
+                  <td>{new Date(r.created_at).toLocaleString()}</td>
+                  <td>
+                    {editing ? (
+                      <InlineNumber
+                        value={editIN.amount}
+                        onChange={(v) => setEditIN((e) => ({ ...e, amount: v }))}
+                      />
+                    ) : currency(r.amount, showKwd)}
+                  </td>
+                  <td>
+                    {editing ? (
+                      <div className="col">
+                        <InlineText
+                          value={editIN.client_name}
+                          onChange={(v) => setEditIN((e) => ({ ...e, client_name: v }))}
+                          placeholder="Client name"
+                        />
+                        <InlineText
+                          value={editIN.client_account}
+                          onChange={(v) => setEditIN((e) => ({ ...e, client_account: v }))}
+                          placeholder="Client account #"
+                        />
+                      </div>
+                    ) : (
+                      <div className="col">
+                        <div>{r.client_name || "-"}</div>
+                        <div className="muted">{r.client_account || "-"}</div>
+                      </div>
+                    )}
+                  </td>
+                  <td>{r.period}</td>
+                  <td>
+                    {editing ? (
+                      <InlineText
+                        value={editIN.note}
+                        onChange={(v) => setEditIN((e) => ({ ...e, note: v }))}
+                        placeholder="Note"
+                      />
+                    ) : (r.note || "-")}
+                  </td>
+                  <td>
+                    {isMine && (
+                      editing ? (
+                        <RowActions saving={false} onSave={saveINEdit} onCancel={() => setEditIN(null)} />
+                      ) : (
+                        <button className="btn" onClick={() => setEditIN({
+                          id: r.id,
+                          amount: r.amount,
+                          client_account: r.client_account,
+                          client_name: r.client_name,
+                          note: r.note,
+                        })}>Edit</button>
+                      )
+                    )}
                   </td>
                 </tr>
               );
             })}
           </tbody>
         </table>
-      </section>
+      </div>
 
-      {/* Your OUT rows */}
-      <section style={{ marginTop: 16, border: "1px solid #e5e7eb", borderRadius: 10, padding: 14 }}>
-        <h3>Your Withdrawals ({monthNames[monthIdx]} {year})</h3>
-        <table width="100%">
-          <thead>
-            <tr>
-              <th align="left">Date</th>
-              <th align="right">Amount</th>
-              <th align="left">Client</th>
-              <th align="left">Account</th>
-              <th align="left">Pref</th>
-              <th align="left">Note</th>
-              <th align="left">Status</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {outRows.length === 0 && (
-              <tr><td colSpan={8} style={{ color: "#777" }}>No requests.</td></tr>
-            )}
-            {outRows.map(row => {
-              const isEditing = editKey?.type === "out" && editKey?.id === row.id;
-              const canEdit = isManager || row.user_id === session.user.id;
-              if (isEditing) {
-                return (
-                  <EditInline
-                    key={row.id}
-                    initial={row}
-                    saving={savingEdit}
-                    onCancel={() => setEditKey(null)}
-                    onSave={(patch) => updateRow("out", row.id, patch)}
-                  />
-                );
-              }
-              return (
-                <tr key={row.id}>
-                  <td>{new Date(row.created_at).toLocaleString()}</td>
-                  <td align="right">{fmtKWD(row.amount, showKwd)}</td>
-                  <td>{row.client_name}</td>
-                  <td>{row.client_account}</td>
-                  <td>{row.pref}</td>
-                  <td>{row.note}</td>
-                  <td style={{ textTransform: "capitalize" }}>{row.status}</td>
-                  <td align="right">
-                    {canEdit && <button onClick={() => setEditKey({ type: "out", id: row.id })}>Edit</button>}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </section>
-
-      {/* Manager: Requests Center */}
-      {isManager && (
-        <section style={{ marginTop: 16, border: "1px solid #e5e7eb", borderRadius: 10, padding: 14 }}>
-          <h3>Withdrawal Requests Center — {monthNames[monthIdx]} {year}</h3>
-          <table width="100%">
-            <thead>
-              <tr>
-                <th align="left">Date</th>
-                <th align="right">Amount</th>
-                <th align="left">Client</th>
-                <th align="left">Account</th>
-                <th align="left">Note</th>
-                <th align="left">Status</th>
-                <th align="right">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {reqRows.length === 0 && (
-                <tr><td colSpan={7} style={{ color: "#777" }}>No requests.</td></tr>
-              )}
-              {reqRows.map(row => (
-                <tr key={row.id}>
-                  <td>{new Date(row.created_at).toLocaleString()}</td>
-                  <td align="right">{fmtKWD(row.amount, showKwd)}</td>
-                  <td>{row.client_name}</td>
-                  <td>{row.client_account}</td>
-                  <td>{row.note}</td>
-                  <td style={{ textTransform: "capitalize" }}>{row.status}</td>
-                  <td align="right" style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
-                    {row.status !== "approved" && (
-                      <button onClick={() => setWithdrawStatus(row.id, "approved")}>Approve</button>
-                    )}
-                    {row.status !== "rejected" && (
-                      <button onClick={() => setWithdrawStatus(row.id, "rejected")}>Reject</button>
-                    )}
-                    <button onClick={() => setEditKey({ type: "out", id: row.id })}>Edit</button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </section>
-      )}
+      <style>{styles}</style>
     </div>
   );
 }
+
+function Metric({ title, value, tone = "neutral" }) {
+  return (
+    <div className={`metric ${tone}`}>
+      <div className="metric-title">{title}</div>
+      <div className="metric-value">{value}</div>
+    </div>
+  );
+}
+
+function AuthButtons() {
+  async function signIn() {
+    const email = window.prompt("Email");
+    const password = window.prompt("Password");
+    if (!email || !password) return;
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) alert(error.message);
+  }
+  async function signUp() {
+    const email = window.prompt("Email");
+    const password = window.prompt("Password (min 6 chars)");
+    if (!email || !password) return;
+    const { error } = await supabase.auth.signUp({ email, password });
+    if (error) alert(error.message);
+    else alert("Check your email (if email confirmation is enabled). Then sign in.");
+  }
+  return (
+    <div className="row gap8">
+      <button className="btn-primary" onClick={signIn}>Sign in</button>
+      <button className="btn" onClick={signUp}>Sign up</button>
+    </div>
+  );
+}
+
+const styles = `
+.page {
+  max-width: 1150px; margin: 0 auto; padding: 18px; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+}
+.card { background:#fff; border:1px solid #e8ecf1; border-radius: 12px; padding: 18px; margin: 0 0 16px; box-shadow: 0 1px 0 rgba(0,0,0,0.02); }
+.header { position: sticky; top: 0; z-index: 10; backdrop-filter: blur(6px); }
+.row { display: flex; align-items: center; gap: 10px; }
+.wrap { flex-wrap: wrap; }
+.col { display: grid; gap: 4px; }
+.spacer { flex: 1; }
+.mt8 { margin-top: 8px; }
+.gap8 { gap: 8px; }
+
+.metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 0 0 12px; }
+.metric { border-radius: 12px; padding: 14px; border:1px solid #eef3f8; background: #fafcff; }
+.metric .metric-title { color:#6b7280; font-size: 13px; }
+.metric .metric-value { font-weight: 700; font-size: 20px; margin-top: 4px; }
+.metric.green { background:#f0fff7; border-color:#dbfbe8; }
+.metric.red { background:#fff5f5; border-color:#ffe3e3; }
+
+.input { border:1px solid #d9e1ea; border-radius: 10px; padding: 8px 10px; background:#fff; min-width: 140px; }
+.btn { border:1px solid #d9e1ea; background:#fff; padding: 8px 12px; border-radius: 10px; cursor: pointer; }
+.btn:hover { background:#f7fafc; }
+.btn-primary { border:1px solid #2563eb; background:#2563eb; color:#fff; padding: 8px 14px; border-radius: 10px; cursor: pointer; }
+.btn-primary:hover { filter: brightness(0.95); }
+
+.table { width:100%; border-collapse: collapse; }
+.table th, .table td { padding: 10px 12px; border-bottom: 1px solid #eef3f8; text-align: left; vertical-align: top; }
+.table th { color:#6b7280; font-weight: 600; font-size: 13px; }
+.muted { color:#6b7280; }
+
+.pill { padding: 3px 8px; border-radius: 999px; font-size: 12px; border:1px solid #e2e8f0; background:#f8fafc; }
+.pill.approved { background:#eafff0; border-color:#d2f9e0; color:#0a8a3a; }
+.pill.pending { background:#fff9e6; border-color:#ffedba; color:#9a6b00; }
+.pill.rejected { background:#ffecec; border-color:#ffd2d2; color:#b42318; }
+
+.row-actions { display:flex; gap:8px; }
+`;
+
